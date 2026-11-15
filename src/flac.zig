@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("c");
-
 const types = @import("types.zig");
+
 pub const StreamInfo = types.StreamInfo;
 pub const Sink = types.Sink;
 
@@ -10,6 +10,7 @@ const Ctx = struct {
     sink: ?Sink = null,
     info: StreamInfo = .{ .sample_rate = 0, .channels = 0, .bits_per_sample = 0 },
     got_info: bool = false,
+    interrupted: bool = false,
 };
 
 fn metadataCallback(
@@ -90,8 +91,10 @@ fn writeCallback(
         }
     }
 
-    sink.write(samples, @intCast(dst_channels)) catch
+    sink.write(samples, @intCast(dst_channels)) catch |err| {
+        if (err == error.Interrupted) ctx.interrupted = true;
         return c.FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    };
 
     return c.FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
@@ -142,7 +145,9 @@ pub const Decoder = struct {
 
     pub fn decode(self: *Decoder, sink: Sink) !void {
         self.ctx.sink = sink;
+        self.ctx.interrupted = false;
         if (c.FLAC__stream_decoder_process_until_end_of_stream(self.handle) == 0) {
+            if (self.ctx.interrupted) return error.Interrupted;
             return error.FlacDecodeFailed;
         }
     }

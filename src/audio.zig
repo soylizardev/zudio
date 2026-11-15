@@ -53,19 +53,52 @@ pub const AudioEngine = struct {
         if (c.snd_pcm_hw_params_malloc(&params) < 0) return false;
         defer c.snd_pcm_hw_params_free(params);
 
-        if (c.snd_pcm_hw_params_any(handle, params) < 0) return false;
-        if (c.snd_pcm_hw_params_set_access(handle, params, c.SND_PCM_ACCESS_RW_INTERLEAVED) < 0) return false;
-        if (c.snd_pcm_hw_params_set_format(handle, params, fmt) < 0) return false;
-        if (c.snd_pcm_hw_params_set_channels(handle, params, @intCast(channels)) < 0) return false;
+        if (c.snd_pcm_hw_params_any(handle, params) < 0) {
+            std.debug.print("    [S32/S24/S16] hw_params_any falló\n", .{});
+            return false;
+        }
+        if (c.snd_pcm_hw_params_set_access(handle, params, c.SND_PCM_ACCESS_RW_INTERLEAVED) < 0) {
+            std.debug.print("    [tryFormat] set_access falló\n", .{});
+            return false;
+        }
+        if (c.snd_pcm_hw_params_set_format(handle, params, fmt) < 0) {
+            std.debug.print("    [tryFormat fmt={s}] set_format falló\n", .{
+                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
+            });
+            return false;
+        }
+        if (c.snd_pcm_hw_params_set_channels(handle, params, @intCast(channels)) < 0) {
+            std.debug.print("    [tryFormat fmt={s}] set_channels falló\n", .{
+                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
+            });
+            return false;
+        }
 
         var rate: c_uint = @intCast(sample_rate);
-        if (c.snd_pcm_hw_params_set_rate_near(handle, params, &rate, null) < 0) return false;
-        if (rate != sample_rate) return false; // strict: no resampling
+        if (c.snd_pcm_hw_params_set_rate_near(handle, params, &rate, null) < 0) {
+            std.debug.print("    [tryFormat fmt={s}] set_rate_near falló\n", .{
+                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
+            });
+            return false;
+        }
+        if (rate != sample_rate) {
+            std.debug.print("    [tryFormat fmt={s}] rate mismatch: pidió {d}, obtuvo {d}\n", .{
+                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
+                sample_rate,
+                rate,
+            });
+            return false;
+        }
 
         var buffer_time: c_uint = 500000;
         _ = c.snd_pcm_hw_params_set_buffer_time_near(handle, params, &buffer_time, null);
 
-        if (c.snd_pcm_hw_params(handle, params) < 0) return false;
+        if (c.snd_pcm_hw_params(handle, params) < 0) {
+            std.debug.print("    [tryFormat fmt={s}] snd_pcm_hw_params falló (commit)\n", .{
+                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
+            });
+            return false;
+        }
         return true;
     }
 
@@ -78,6 +111,8 @@ pub const AudioEngine = struct {
         source_bits: u8,
     ) !void {
         const handle = self.pcm_handle orelse return error.NotInitialized;
+        _ = c.snd_pcm_drop(handle); 
+        _ = c.snd_pcm_hw_free(handle);
 
         const candidates = [_]struct {
             fmt: c.snd_pcm_format_t,
@@ -211,6 +246,12 @@ pub const AudioEngine = struct {
             rate,
             ch,
         });
+    }
+
+    pub fn drop(self: *AudioEngine) void {
+        if (self.pcm_handle) |h| {
+            _ = c.snd_pcm_drop(h);
+        }
     }
 
     pub fn deinit(self: *AudioEngine) void {
