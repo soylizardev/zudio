@@ -23,6 +23,7 @@ pub const Decoder = struct {
                 .sample_rate = h.sampleRate,
                 .channels = @intCast(h.channels),
                 .bits_per_sample = @intCast(h.bitsPerSample),
+                .total_frames = h.totalPCMFrameCount,
             },
         };
     }
@@ -56,6 +57,13 @@ pub const Decoder = struct {
             } else {
                 try sink.write(buf[0 .. n * 2], 2);
             }
+        }
+    }
+
+    pub fn seekToFrame(self: *Decoder, frame: u64) !void {
+        const handle = self.handle orelse return error.NotInitialized;
+        if (c.drwav_seek_to_pcm_frame(handle, frame) == 0) {
+            return error.SeekFailed;
         }
     }
 

@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const c_header = b.addWriteFiles().add("c.h",
         \\#include <alsa/asoundlib.h>
         \\#include <FLAC/stream_decoder.h>
+        \\#include <FLAC/metadata.h>
         \\#include "dr_mp3.h"
         \\#include "dr_wav.h"
     );

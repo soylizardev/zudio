@@ -28,6 +28,12 @@ pub const AudioEngine = struct {
     pcm_handle: ?*c.snd_pcm_t = null,
     active_format: ActiveFormat = .s32le,
 
+    // Cache para evitar reconfigurar ALSA cuando no es necesario (seek rápido).
+    has_config: bool = false,
+    last_sample_rate: u32 = 0,
+    last_channels: u16 = 0,
+    last_source_bits: u8 = 0,
+
     pub fn init(device: [:0]const u8) !AudioEngine {
         var handle: ?*c.snd_pcm_t = null;
         const err = c.snd_pcm_open(&handle, device.ptr, c.SND_PCM_STREAM_PLAYBACK, 0);
@@ -41,8 +47,6 @@ pub const AudioEngine = struct {
         return .{ .pcm_handle = handle };
     }
 
-    /// Prueba si el hardware acepta (fmt, rate, channels) exactamente, sin
-    /// plugins ni remuestreo. Devuelve true si logró commitear los params.
     fn tryFormat(
         handle: ?*c.snd_pcm_t,
         fmt: c.snd_pcm_format_t,
@@ -53,57 +57,22 @@ pub const AudioEngine = struct {
         if (c.snd_pcm_hw_params_malloc(&params) < 0) return false;
         defer c.snd_pcm_hw_params_free(params);
 
-        if (c.snd_pcm_hw_params_any(handle, params) < 0) {
-            std.debug.print("    [S32/S24/S16] hw_params_any falló\n", .{});
-            return false;
-        }
-        if (c.snd_pcm_hw_params_set_access(handle, params, c.SND_PCM_ACCESS_RW_INTERLEAVED) < 0) {
-            std.debug.print("    [tryFormat] set_access falló\n", .{});
-            return false;
-        }
-        if (c.snd_pcm_hw_params_set_format(handle, params, fmt) < 0) {
-            std.debug.print("    [tryFormat fmt={s}] set_format falló\n", .{
-                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
-            });
-            return false;
-        }
-        if (c.snd_pcm_hw_params_set_channels(handle, params, @intCast(channels)) < 0) {
-            std.debug.print("    [tryFormat fmt={s}] set_channels falló\n", .{
-                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
-            });
-            return false;
-        }
+        if (c.snd_pcm_hw_params_any(handle, params) < 0) return false;
+        if (c.snd_pcm_hw_params_set_access(handle, params, c.SND_PCM_ACCESS_RW_INTERLEAVED) < 0) return false;
+        if (c.snd_pcm_hw_params_set_format(handle, params, fmt) < 0) return false;
+        if (c.snd_pcm_hw_params_set_channels(handle, params, @intCast(channels)) < 0) return false;
 
         var rate: c_uint = @intCast(sample_rate);
-        if (c.snd_pcm_hw_params_set_rate_near(handle, params, &rate, null) < 0) {
-            std.debug.print("    [tryFormat fmt={s}] set_rate_near falló\n", .{
-                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
-            });
-            return false;
-        }
-        if (rate != sample_rate) {
-            std.debug.print("    [tryFormat fmt={s}] rate mismatch: pidió {d}, obtuvo {d}\n", .{
-                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
-                sample_rate,
-                rate,
-            });
-            return false;
-        }
+        if (c.snd_pcm_hw_params_set_rate_near(handle, params, &rate, null) < 0) return false;
+        if (rate != sample_rate) return false;
 
         var buffer_time: c_uint = 500000;
         _ = c.snd_pcm_hw_params_set_buffer_time_near(handle, params, &buffer_time, null);
 
-        if (c.snd_pcm_hw_params(handle, params) < 0) {
-            std.debug.print("    [tryFormat fmt={s}] snd_pcm_hw_params falló (commit)\n", .{
-                std.mem.sliceTo(c.snd_pcm_format_name(fmt), 0),
-            });
-            return false;
-        }
+        if (c.snd_pcm_hw_params(handle, params) < 0) return false;
         return true;
     }
 
-    /// Negocia el mejor formato de hardware disponible:
-    /// S32_LE → S24_3LE → S16_LE. Advierte si hay truncación.
     pub fn configure(
         self: *AudioEngine,
         sample_rate: u32,
@@ -111,7 +80,20 @@ pub const AudioEngine = struct {
         source_bits: u8,
     ) !void {
         const handle = self.pcm_handle orelse return error.NotInitialized;
-        _ = c.snd_pcm_drop(handle); 
+
+        // Cache: si los parámetros son idénticos a la última configuración
+        // (caso típico al hacer seek en la misma pista), solo hacemos drop.
+        if (self.has_config and
+            self.last_sample_rate == sample_rate and
+            self.last_channels == channels and
+            self.last_source_bits == source_bits)
+        {
+            _ = c.snd_pcm_drop(handle);
+            _ = c.snd_pcm_prepare(handle);
+            return;
+        }
+
+        _ = c.snd_pcm_drop(handle);
         _ = c.snd_pcm_hw_free(handle);
 
         const candidates = [_]struct {
@@ -126,6 +108,10 @@ pub const AudioEngine = struct {
         for (candidates) |cand| {
             if (tryFormat(handle, cand.fmt, sample_rate, channels)) {
                 self.active_format = cand.tag;
+                self.last_sample_rate = sample_rate;
+                self.last_channels = channels;
+                self.last_source_bits = source_bits;
+                self.has_config = true;
                 if (source_bits > cand.tag.bits()) {
                     std.debug.print(
                         "AVISO: archivo de {d} bits truncado a {d} bits (hardware solo acepta {s}).\n",
@@ -198,7 +184,7 @@ pub const AudioEngine = struct {
         const max_buf_frames: usize = 1024;
         const max_samples = max_buf_frames * @as(usize, num_channels);
 
-        var buf: [6144]u8 = undefined; // 1024 frames × 2 ch × 3 bytes
+        var buf: [6144]u8 = undefined;
         var offset: usize = 0;
 
         while (offset < samples.len) {
@@ -221,6 +207,20 @@ pub const AudioEngine = struct {
             }
             offset += @as(usize, @intCast(written)) * num_channels;
         }
+    }
+
+    pub fn drop(self: *AudioEngine) void {
+        if (self.pcm_handle) |h| _ = c.snd_pcm_drop(h);
+    }
+
+    pub fn pause(self: *AudioEngine) !void {
+        const handle = self.pcm_handle orelse return error.NotInitialized;
+        if (c.snd_pcm_pause(handle, 1) < 0) return error.PauseFailed;
+    }
+
+    pub fn unpause(self: *AudioEngine) !void {
+        const handle = self.pcm_handle orelse return error.NotInitialized;
+        if (c.snd_pcm_pause(handle, 0) < 0) return error.ResumeFailed;
     }
 
     pub fn drain(self: *AudioEngine) void {
@@ -246,12 +246,6 @@ pub const AudioEngine = struct {
             rate,
             ch,
         });
-    }
-
-    pub fn drop(self: *AudioEngine) void {
-        if (self.pcm_handle) |h| {
-            _ = c.snd_pcm_drop(h);
-        }
     }
 
     pub fn deinit(self: *AudioEngine) void {

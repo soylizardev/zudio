@@ -39,6 +39,14 @@ pub const Decoder = union(Format) {
         }
     }
 
+    pub fn seekToFrame(self: *Decoder, frame: u64) !void {
+        switch (self.*) {
+            .flac => |*d| try d.seekToFrame(frame),
+            .mp3 => |*d| try d.seekToFrame(frame),
+            .wav => |*d| try d.seekToFrame(frame),
+        }
+    }
+
     pub fn deinit(self: *Decoder) void {
         switch (self.*) {
             .flac => |*d| d.deinit(),

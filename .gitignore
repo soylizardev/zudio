@@ -1,0 +1,33 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Dependencias descargadas por zig fetch
+zig-pkg/
+
+# Binarios compilados
+zudio
+*.o
+*.a
+*.so
+
+# Archivos de test locales
+test.flac
+test.mp3
+test.wav
+
+# Configuración local de editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Logs y temporales
+*.log
+/tmp/

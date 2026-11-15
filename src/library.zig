@@ -1,10 +1,13 @@
 const std = @import("std");
+const metadata = @import("metadata.zig");
 
 pub const Track = struct {
     path: [:0]u8,
+    info: metadata.TrackInfo,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Track) void {
+        self.info.deinit(self.allocator);
         self.allocator.free(self.path);
     }
 };
@@ -19,8 +22,6 @@ pub const Library = struct {
     }
 };
 
-/// Escanea `root_path` recursivamente y devuelve todas las pistas de audio
-/// reconocidas (.flac, .mp3, .wav), en orden alfabético.
 pub fn scan(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8) !Library {
     var tracks: std.ArrayListUnmanaged(Track) = .empty;
     errdefer {
@@ -57,7 +58,8 @@ fn scanDir(
             else
                 try std.fmt.allocPrintSentinel(allocator, "{s}/{s}/{s}", .{ root_path, prefix, entry.name }, 0);
             errdefer allocator.free(full);
-            try tracks.append(allocator, .{ .path = full, .allocator = allocator });
+            const info = metadata.readTrackInfo(allocator, full);
+            try tracks.append(allocator, .{ .path = full, .info = info, .allocator = allocator });
         } else if (entry.kind == .directory) {
             var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
             defer sub.close(io);

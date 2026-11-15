@@ -26,6 +26,7 @@ fn metadataCallback(
         ctx.info.sample_rate = meta.data.stream_info.sample_rate;
         ctx.info.channels = @intCast(meta.data.stream_info.channels);
         ctx.info.bits_per_sample = @intCast(meta.data.stream_info.bits_per_sample);
+        ctx.info.total_frames = meta.data.stream_info.total_samples;
         ctx.got_info = true;
     }
 }
@@ -61,7 +62,6 @@ fn writeCallback(
         return c.FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
     }
 
-    // Alineación al MSB del contenedor S32.
     const shift: u5 = switch (ctx.info.bits_per_sample) {
         16 => 16,
         24 => 8,
@@ -72,7 +72,6 @@ fn writeCallback(
         },
     };
 
-    // Por ahora siempre estéreo en el destino (mono se duplica).
     const dst_channels: usize = 2;
     const samples = ctx.allocator.alloc(i32, blocksize * dst_channels) catch
         return c.FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
@@ -149,6 +148,28 @@ pub const Decoder = struct {
         if (c.FLAC__stream_decoder_process_until_end_of_stream(self.handle) == 0) {
             if (self.ctx.interrupted) return error.Interrupted;
             return error.FlacDecodeFailed;
+        }
+    }
+
+    pub fn seekToFrame(self: *Decoder, frame: u64) !void {
+        // libFLAC decodifica internamente durante seek_absolute y llama a
+        // writeCallback. Necesitamos un sink que descarte para que el callback
+        // no devuelva ABORT (lo que haría fallar el seek).
+        const prev_sink = self.ctx.sink;
+        self.ctx.sink = Sink{
+            .ptr = self.ctx,
+            .writeFn = struct {
+                fn write(ptr: *anyopaque, samples: []const i32, channels: u16) anyerror!void {
+                    _ = ptr;
+                    _ = samples;
+                    _ = channels;
+                }
+            }.write,
+        };
+        defer self.ctx.sink = prev_sink;
+
+        if (c.FLAC__stream_decoder_seek_absolute(self.handle, frame) == 0) {
+            return error.SeekFailed;
         }
     }
 

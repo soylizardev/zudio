@@ -24,6 +24,7 @@ pub const Decoder = struct {
                 .sample_rate = h.sampleRate,
                 .channels = @intCast(h.channels),
                 .bits_per_sample = 16, // dr_mp3 decodifica siempre a i16
+                .total_frames = c.drmp3_get_pcm_frame_count(h),
             },
         };
     }
@@ -59,6 +60,13 @@ pub const Decoder = struct {
                 }
                 try sink.write(out[0 .. n * 2], 2);
             }
+        }
+    }
+
+    pub fn seekToFrame(self: *Decoder, frame: u64) !void {
+        const handle = self.handle orelse return error.NotInitialized;
+        if (c.drmp3_seek_to_pcm_frame(handle, frame) == 0) {
+            return error.SeekFailed;
         }
     }
 
