@@ -12,6 +12,8 @@ pub const Player = struct {
     tracks: []library.Track,
     io: std.Io,
 
+    active_queue: std.ArrayListUnmanaged(usize) = .empty,
+
     current_index: std.atomic.Value(i64) = .init(-1),
     stop_requested: std.atomic.Value(bool) = .init(false),
     samples_written: std.atomic.Value(u64) = .init(0),
@@ -35,6 +37,16 @@ pub const Player = struct {
         return .{ .allocator = allocator, .engine = engine, .tracks = tracks, .io = io };
     }
 
+    pub fn deinit(self: *Player) void {
+        self.active_queue.deinit(self.allocator);
+    }
+
+    /// Sustituye la cola activa. Los índices son posiciones en `library.tracks`.
+    pub fn setQueue(self: *Player, indices: []const usize) void {
+        self.active_queue.clearRetainingCapacity();
+        self.active_queue.appendSlice(self.allocator, indices) catch {};
+    }
+
     pub fn requestStop(self: *Player) void {
         self.stop_requested.store(true, .release);
     }
@@ -50,36 +62,77 @@ pub const Player = struct {
         self.repeat_mode.store(next, .monotonic);
     }
 
+    fn currentQueuePos(self: *Player) ?usize {
+        const cur_i = self.current_index.load(.acquire);
+        if (cur_i < 0) return null;
+        const cur: usize = @intCast(cur_i);
+        for (self.active_queue.items, 0..) |idx, pos| {
+            if (idx == cur) return pos;
+        }
+        return null;
+    }
+
     pub fn nextIndex(self: *Player) ?usize {
         const total = self.tracks.len;
         if (total == 0) return null;
-        const cur_i = self.current_index.load(.acquire);
-        const cur: usize = if (cur_i < 0) 0 else @intCast(cur_i);
+
+        // Si no hay cola configurada, fallback a "todas".
+        if (self.active_queue.items.len == 0) {
+            const cur_i = self.current_index.load(.acquire);
+            const cur: usize = if (cur_i < 0) 0 else @intCast(cur_i);
+            if (self.shuffle.load(.monotonic)) {
+                if (total == 1) return 0;
+                const rng_impl: std.Random.IoSource = .{ .io = self.io };
+                const rng = rng_impl.interface();
+                var pick: usize = cur;
+                while (pick == cur) {
+                    pick = rng.uintLessThan(usize, total);
+                }
+                return pick;
+            }
+            if (cur + 1 < total) return cur + 1;
+            if (self.repeat_mode.load(.monotonic) == 1) return 0;
+            return null;
+        }
+
+        const queue = self.active_queue.items;
+        const pos = self.currentQueuePos() orelse 0;
 
         if (self.shuffle.load(.monotonic)) {
-            if (total == 1) return 0;
+            if (queue.len == 1) return queue[0];
             const rng_impl: std.Random.IoSource = .{ .io = self.io };
             const rng = rng_impl.interface();
-            var pick: usize = cur;
-            while (pick == cur) {
-                pick = rng.uintLessThan(usize, total);
+            var pick_pos: usize = pos;
+            while (pick_pos == pos) {
+                pick_pos = rng.uintLessThan(usize, queue.len);
             }
-            return pick;
+            return queue[pick_pos];
         }
-        if (cur + 1 < total) return cur + 1;
-        if (self.repeat_mode.load(.monotonic) == 1) return 0;
+        if (pos + 1 < queue.len) return queue[pos + 1];
+        if (self.repeat_mode.load(.monotonic) == 1) return queue[0];
         return null;
     }
 
     pub fn prevIndex(self: *Player) ?usize {
         const total = self.tracks.len;
         if (total == 0) return null;
-        const cur_i = self.current_index.load(.acquire);
-        if (cur_i <= 0) {
-            if (self.repeat_mode.load(.monotonic) == 1) return total - 1;
-            return 0;
+
+        if (self.active_queue.items.len == 0) {
+            const cur_i = self.current_index.load(.acquire);
+            if (cur_i <= 0) {
+                if (self.repeat_mode.load(.monotonic) == 1) return total - 1;
+                return 0;
+            }
+            return @intCast(cur_i - 1);
         }
-        return @intCast(cur_i - 1);
+
+        const queue = self.active_queue.items;
+        const pos = self.currentQueuePos() orelse 0;
+        if (pos == 0) {
+            if (self.repeat_mode.load(.monotonic) == 1) return queue[queue.len - 1];
+            return queue[0];
+        }
+        return queue[pos - 1];
     }
 
     fn makeSink(self: *Player) decoder.Sink {
@@ -161,8 +214,6 @@ pub const Player = struct {
         };
         defer self.engine.drop();
 
-        // Intentar seek rápido. Si falla, cerrar el decoder y reabrirlo limpio,
-        // porque libFLAC deja el stream en estado ABORTED tras un seek fallido.
         if (start_frame > 0) {
             if (dec.seekToFrame(start_frame)) |_| {
                 std.debug.print("  seek rápido OK a frame {d}\n", .{start_frame});
@@ -189,8 +240,6 @@ pub const Player = struct {
 
         dec.decode(self.makeSink()) catch |err| switch (err) {
             error.Interrupted => {
-                // drop descarta el buffer inmediatamente (sin esperar 500ms del drain).
-                // Es lo correcto al cambiar de pista o hacer seek.
                 self.engine.drop();
                 self.is_playing.store(false, .release);
                 return switch (self.interrupt_reason) {

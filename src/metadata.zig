@@ -12,6 +12,8 @@ pub const TrackInfo = struct {
     sample_rate: u32 = 0,
     bits_per_sample: u8 = 0,
     channels: u16 = 0,
+    cover_data: ?[]u8 = null,
+    cover_mime: ?[]u8 = null,
 
     pub fn deinit(self: *TrackInfo, allocator: std.mem.Allocator) void {
         if (self.title) |s| allocator.free(s);
@@ -19,6 +21,8 @@ pub const TrackInfo = struct {
         if (self.album) |s| allocator.free(s);
         if (self.year) |s| allocator.free(s);
         if (self.genre) |s| allocator.free(s);
+        if (self.cover_data) |s| allocator.free(s);
+        if (self.cover_mime) |s| allocator.free(s);
     }
 };
 
@@ -71,15 +75,28 @@ fn readFlacMetadata(allocator: std.mem.Allocator, path: [:0]const u8, info: *Tra
                     assignVorbisTag(allocator, info, entry);
                 }
             },
+            c.FLAC__METADATA_TYPE_PICTURE => {
+                // Solo nos interesa la portada frontal (type 3).
+                const pic = meta.data.picture;
+                if (pic.type == c.FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER) {
+                    if (pic.mime_type != null) {
+                        const mt_slice = std.mem.span(@as([*:0]const u8, @ptrCast(pic.mime_type)));
+                        if (info.cover_mime) |s| allocator.free(s);
+                        info.cover_mime = allocator.dupe(u8, mt_slice) catch null;
+                    }
+                    if (pic.data != null and pic.data_length > 0) {
+                        const data_slice: []const u8 = @as([*]const u8, @ptrCast(pic.data))[0..pic.data_length];
+                        if (info.cover_data) |s| allocator.free(s);
+                        info.cover_data = allocator.dupe(u8, data_slice) catch null;
+                    }
+                }
+            },
             else => {},
         }
     }
 }
 
 fn readMp3BasicInfo(path: [:0]const u8, info: *TrackInfo) void {
-    // dr_mp3 entrega los tags ID3 por callback, no como array en el struct.
-    // Por ahora solo leemos la información básica del stream (sample rate,
-    // canales, duración). El título/artista/álbum caerá al nombre de archivo.
     var mp3: c.drmp3 = undefined;
     if (c.drmp3_init_file(&mp3, path.ptr, null) == 0) return;
     defer c.drmp3_uninit(&mp3);
@@ -91,8 +108,6 @@ fn readMp3BasicInfo(path: [:0]const u8, info: *TrackInfo) void {
 }
 
 fn readWavBasicInfo(path: [:0]const u8, info: *TrackInfo) void {
-    // dr_wav expone los metadatos en pMetadata/metadataCount solo si se usa
-    // drwav_init_file_with_metadata. Por ahora solo leemos la info básica.
     var wav: c.drwav = undefined;
     if (c.drwav_init_file(&wav, path.ptr, null) == 0) return;
     defer _ = c.drwav_uninit(&wav);

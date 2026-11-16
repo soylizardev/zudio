@@ -147,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
         defer engine.deinit();
 
         var p = player.Player.init(allocator, &engine, lib.tracks, init.io);
+        defer p.deinit();
 
         const home = init.environ_map.get("HOME") orelse ".";
         var fav = try favorites.Favorites.init(allocator, init.io, home);
@@ -200,6 +201,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         var p = player.Player.init(allocator, &engine, lib.tracks, init.io);
+        defer p.deinit();
         p.max_seconds = limit_seconds;
         _ = try p.playAllFrom(0);
 

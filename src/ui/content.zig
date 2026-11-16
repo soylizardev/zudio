@@ -1,6 +1,7 @@
 const std = @import("std");
 const gtk = @import("gtk");
 const adw = @import("adw");
+const gdk = @import("gdk");
 const glib = @import("glib");
 const library = @import("../library.zig");
 const sidebar = @import("sidebar.zig");
@@ -19,20 +20,22 @@ pub const RowCtx = struct {
 pub const PageBuilt = struct {
     page: *adw.NavigationPage,
     fav_buttons: std.StringHashMapUnmanaged(*gtk.Button) = .empty,
+    queue: []usize = &.{},
 
     pub fn deinit(self: *PageBuilt) void {
         self.fav_buttons.deinit(std.heap.page_allocator);
+        if (self.queue.len > 0) std.heap.page_allocator.free(self.queue);
     }
+};
+
+const TrackEntry = struct {
+    track: *const library.Track,
+    index: usize,
 };
 
 const TrackListResult = struct {
     scroll: *gtk.ScrolledWindow,
     list_box: *gtk.ListBox,
-};
-
-const ToolbarResult = struct {
-    toolbar: *adw.ToolbarView,
-    list_box: ?*gtk.ListBox = null,
 };
 
 pub fn buildPage(
@@ -44,8 +47,35 @@ pub fn buildPage(
 ) PageBuilt {
     var fav_buttons: std.StringHashMapUnmanaged(*gtk.Button) = .empty;
     const tb = buildToolbar(item, lib, fav, activation_ctx, on_pressed, &fav_buttons);
-    const page = adw.NavigationPage.new(@ptrCast(@alignCast(tb.toolbar)), item.title());
-    return .{ .page = page, .fav_buttons = fav_buttons };
+    const page = adw.NavigationPage.new(@ptrCast(@alignCast(tb)), item.title());
+
+    const alloc = std.heap.page_allocator;
+    var queue: []usize = &.{};
+    if (lib) |l| {
+        var q: std.ArrayListUnmanaged(usize) = .empty;
+        switch (item) {
+            .todas, .anadidos_recientemente => {
+                for (0..l.tracks.len) |i| {
+                    q.append(alloc, i) catch {};
+                }
+            },
+            .favoritos => {
+                for (l.tracks, 0..) |t, i| {
+                    if (fav.isFavorite(t.path)) {
+                        q.append(alloc, i) catch {};
+                    }
+                }
+            },
+            else => {},
+        }
+        if (q.items.len > 0) {
+            queue = q.toOwnedSlice(alloc) catch &.{};
+        } else {
+            q.deinit(alloc);
+        }
+    }
+
+    return .{ .page = page, .fav_buttons = fav_buttons, .queue = queue };
 }
 
 fn buildToolbar(
@@ -55,7 +85,7 @@ fn buildToolbar(
     activation_ctx: ?*anyopaque,
     on_pressed: ?RowPressedFn,
     fav_buttons: *std.StringHashMapUnmanaged(*gtk.Button),
-) ToolbarResult {
+) *adw.ToolbarView {
     const toolbar = adw.ToolbarView.new();
     const header = adw.HeaderBar.new();
     adw.ToolbarView.addTopBar(toolbar, @ptrCast(@alignCast(header)));
@@ -64,9 +94,15 @@ fn buildToolbar(
         .todas, .anadidos_recientemente => {
             if (lib) |l| {
                 if (l.tracks.len > 0) {
-                    const tl = buildTrackList(l.tracks, fav, activation_ctx, on_pressed, fav_buttons);
+                    const alloc = std.heap.page_allocator;
+                    var entries: std.ArrayListUnmanaged(TrackEntry) = .empty;
+                    defer entries.deinit(alloc);
+                    for (l.tracks, 0..) |*t, i| {
+                        entries.append(alloc, .{ .track = t, .index = i }) catch {};
+                    }
+                    const tl = buildTrackList(entries.items, fav, activation_ctx, on_pressed, fav_buttons);
                     adw.ToolbarView.setContent(toolbar, @ptrCast(@alignCast(tl.scroll)));
-                    return .{ .toolbar = toolbar, .list_box = tl.list_box };
+                    return toolbar;
                 }
             }
             showEmptyState(toolbar, item);
@@ -74,24 +110,24 @@ fn buildToolbar(
         .favoritos => {
             if (lib) |l| {
                 const alloc = std.heap.page_allocator;
-                var filtered: std.ArrayListUnmanaged(library.Track) = .empty;
-                defer filtered.deinit(alloc);
-                for (l.tracks) |t| {
+                var entries: std.ArrayListUnmanaged(TrackEntry) = .empty;
+                defer entries.deinit(alloc);
+                for (l.tracks, 0..) |*t, i| {
                     if (fav.isFavorite(t.path)) {
-                        filtered.append(alloc, t) catch {};
+                        entries.append(alloc, .{ .track = t, .index = i }) catch {};
                     }
                 }
-                if (filtered.items.len > 0) {
-                    const tl = buildTrackList(filtered.items, fav, activation_ctx, on_pressed, fav_buttons);
+                if (entries.items.len > 0) {
+                    const tl = buildTrackList(entries.items, fav, activation_ctx, on_pressed, fav_buttons);
                     adw.ToolbarView.setContent(toolbar, @ptrCast(@alignCast(tl.scroll)));
-                    return .{ .toolbar = toolbar, .list_box = tl.list_box };
+                    return toolbar;
                 }
             }
             showEmptyState(toolbar, item);
         },
         else => showEmptyState(toolbar, item),
     }
-    return .{ .toolbar = toolbar, .list_box = null };
+    return toolbar;
 }
 
 fn showEmptyState(toolbar: *adw.ToolbarView, item: sidebar.NavItem) void {
@@ -125,7 +161,7 @@ fn descriptionFor(item: sidebar.NavItem) [:0]const u8 {
 }
 
 fn buildTrackList(
-    tracks: []const library.Track,
+    entries: []const TrackEntry,
     fav: *favorites.Favorites,
     activation_ctx: ?*anyopaque,
     on_pressed: ?RowPressedFn,
@@ -141,7 +177,8 @@ fn buildTrackList(
     gtk.Widget.setMarginStart(@ptrCast(@alignCast(list)), 12);
     gtk.Widget.setMarginEnd(@ptrCast(@alignCast(list)), 12);
 
-    for (tracks, 0..) |track, idx| {
+    for (entries) |entry| {
+        const track = entry.track.*;
         const row = adw.ActionRow.new();
 
         const title_str: []const u8 = track.info.title orelse std.fs.path.basename(track.path);
@@ -164,10 +201,28 @@ fn buildTrackList(
         defer std.heap.page_allocator.free(subtitle_z);
         adw.ActionRow.setSubtitle(row, subtitle_z.ptr);
 
+        const img = gtk.Image.new();
+        gtk.Image.setPixelSize(img, 40);
+        var cover_loaded = false;
+        if (track.info.cover_data) |data| {
+            const bytes_obj = glib.Bytes.new(@ptrCast(data.ptr), data.len);
+            defer glib.Bytes.unref(bytes_obj);
+            const texture_opt = gdk.Texture.newFromBytes(bytes_obj, null);
+            if (texture_opt) |texture| {
+                gtk.Image.setFromPaintable(img, @ptrCast(@alignCast(texture)));
+                cover_loaded = true;
+            }
+        }
+        if (!cover_loaded) {
+            gtk.Image.setFromIconName(img, "media-optical-symbolic");
+            gtk.Widget.addCssClass(@ptrCast(@alignCast(img)), "dim-label");
+        }
+        adw.ActionRow.addPrefix(row, @ptrCast(@alignCast(img)));
+
         const ctx = std.heap.page_allocator.create(RowCtx) catch continue;
         ctx.* = .{
             .app = activation_ctx orelse continue,
-            .idx = idx,
+            .idx = entry.index,
             .fav = fav,
             .track_path = track.path,
         };
@@ -179,7 +234,6 @@ fn buildTrackList(
         gtk.Widget.addCssClass(@ptrCast(@alignCast(fav_btn)), "circular");
         adw.ActionRow.addSuffix(row, @ptrCast(@alignCast(fav_btn)));
 
-        // Registrar el botón en el mapa para que la barra pueda actualizarlo.
         fav_buttons.put(std.heap.page_allocator, track.path, fav_btn) catch {};
 
         const btn_gesture = gtk.GestureClick.new();

@@ -170,5 +170,10 @@ fn onRowPressed(
     const self: *MainWindow = @ptrCast(@alignCast(ctx.app));
     if (ctx.idx >= self.library.tracks.len) return;
 
+    // Establecer la cola activa según la vista actual antes de reproducir.
+    if (self.current_page) |*p| {
+        self.controller.setQueue(p.queue);
+    }
+
     self.controller.play(ctx.idx);
 }

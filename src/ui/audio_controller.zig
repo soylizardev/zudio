@@ -21,6 +21,10 @@ pub const AudioController = struct {
         return self;
     }
 
+    pub fn setQueue(self: *AudioController, indices: []const usize) void {
+        self.player.setQueue(indices);
+    }
+
     pub fn play(self: *AudioController, index: usize) void {
         self.player.engine.unpause() catch {};
         self.player.is_paused.store(false, .release);

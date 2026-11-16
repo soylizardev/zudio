@@ -1,6 +1,8 @@
 const std = @import("std");
 const gtk = @import("gtk");
 const adw = @import("adw");
+const gdk = @import("gdk");
+const glib = @import("glib");
 const audio_controller = @import("audio_controller.zig");
 const player = @import("../player.zig");
 const favorites = @import("../favorites.zig");
@@ -9,6 +11,7 @@ pub const FavoriteChangedFn = *const fn (ctx: *anyopaque, path: []const u8, is_f
 
 pub const PlayerBar = struct {
     root: *gtk.Box,
+    cover_img: *gtk.Image,
     title_label: *gtk.Label,
     artist_label: *gtk.Label,
     time_current: *gtk.Label,
@@ -24,6 +27,7 @@ pub const PlayerBar = struct {
     fav_callback: ?FavoriteChangedFn = null,
     fav_callback_ctx: ?*anyopaque = null,
     last_known_index: i64 = -1,
+    last_cover_index: i64 = -2,
     last_fav_state: bool = false,
     pending_seek_frame: ?u64 = null,
     pending_seek_ticks: u32 = 0,
@@ -40,6 +44,13 @@ pub const PlayerBar = struct {
         gtk.Widget.setMarginBottom(@ptrCast(@alignCast(bar)), 8);
         gtk.Widget.setMarginStart(@ptrCast(@alignCast(bar)), 16);
         gtk.Widget.setMarginEnd(@ptrCast(@alignCast(bar)), 16);
+
+        // Portada a la izquierda.
+        const cover_img = gtk.Image.new();
+        gtk.Image.setPixelSize(cover_img, 56);
+        gtk.Image.setFromIconName(cover_img, "media-optical-symbolic");
+        gtk.Widget.addCssClass(@ptrCast(@alignCast(cover_img)), "dim-label");
+        gtk.Box.append(bar, @ptrCast(@alignCast(cover_img)));
 
         const info_box = gtk.Box.new(gtk.Orientation.vertical, 2);
         gtk.Widget.setHexpand(@ptrCast(@alignCast(info_box)), 1);
@@ -67,7 +78,6 @@ pub const PlayerBar = struct {
         const btn_play = makeIconButton("media-playback-start-symbolic", "Reproducir");
         const btn_next = makeIconButton("media-skip-forward-symbolic", "Siguiente");
         const btn_repeat = makeIconButton("media-playlist-repeat-symbolic", "Repetir");
-
         const btn_favorite = makeIconButton("non-starred-symbolic", "Marcar como favorito");
 
         gtk.Box.append(controls, @ptrCast(@alignCast(btn_shuffle)));
@@ -103,6 +113,7 @@ pub const PlayerBar = struct {
         const self = std.heap.page_allocator.create(PlayerBar) catch unreachable;
         self.* = .{
             .root = bar,
+            .cover_img = cover_img,
             .title_label = title,
             .artist_label = artist,
             .time_current = time_current,
@@ -169,6 +180,36 @@ pub const PlayerBar = struct {
             }
         }
 
+        // Actualizar portada al cambiar de pista.
+        if (cur_idx != self.last_cover_index) {
+            self.last_cover_index = cur_idx;
+            if (cur_idx >= 0) {
+                const idx: usize = @intCast(cur_idx);
+                if (idx < self.player_ref.tracks.len) {
+                    const track = self.player_ref.tracks[idx];
+                    var cover_loaded = false;
+                    if (track.info.cover_data) |data| {
+                        const bytes_obj = glib.Bytes.new(@ptrCast(data.ptr), data.len);
+                        defer glib.Bytes.unref(bytes_obj);
+                        const texture_opt = gdk.Texture.newFromBytes(bytes_obj, null);
+                        if (texture_opt) |texture| {
+                            gtk.Image.setFromPaintable(self.cover_img, @ptrCast(@alignCast(texture)));
+                            gtk.Widget.removeCssClass(@ptrCast(@alignCast(self.cover_img)), "dim-label");
+                            cover_loaded = true;
+                        }
+                    }
+                    if (!cover_loaded) {
+                        gtk.Image.setFromIconName(self.cover_img, "media-optical-symbolic");
+                        gtk.Widget.addCssClass(@ptrCast(@alignCast(self.cover_img)), "dim-label");
+                    }
+                }
+            } else {
+                gtk.Image.setFromIconName(self.cover_img, "media-optical-symbolic");
+                gtk.Widget.addCssClass(@ptrCast(@alignCast(self.cover_img)), "dim-label");
+            }
+        }
+
+        // Sincronizar estrella de favorito.
         if (cur_idx >= 0) {
             const idx: usize = @intCast(cur_idx);
             if (idx < self.player_ref.tracks.len) {
@@ -284,7 +325,6 @@ fn onFavClicked(btn: *gtk.Button, self: *PlayerBar) callconv(.c) void {
     self.last_fav_state = now_fav;
     self.fav.save();
 
-    // Notificar al MainWindow para que actualice la fila de la lista al instante.
     if (self.fav_callback) |cb| {
         if (self.fav_callback_ctx) |ctx| {
             cb(ctx, track.path, now_fav);
