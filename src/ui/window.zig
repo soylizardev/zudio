@@ -112,13 +112,12 @@ fn tickCallback(data: ?*anyopaque) callconv(.c) c_int {
 pub fn onFavoriteChanged(ctx: *anyopaque, path: []const u8, is_fav: bool) void {
     const self: *MainWindow = @ptrCast(@alignCast(ctx));
     if (self.current_page) |*p| {
-        if (p.fav_buttons.get(path)) |btn| {
+        if (p.view_state.fav_buttons.get(path)) |btn| {
             const icon: [:0]const u8 = if (is_fav) "starred-symbolic" else "non-starred-symbolic";
             gtk.Button.setIconName(btn, icon);
         }
     }
 }
-
 fn onNavSelected(
     list: *gtk.ListBox,
     row: ?*gtk.ListBoxRow,
@@ -170,9 +169,8 @@ fn onRowPressed(
     const self: *MainWindow = @ptrCast(@alignCast(ctx.app));
     if (ctx.idx >= self.library.tracks.len) return;
 
-    // Establecer la cola activa según la vista actual antes de reproducir.
     if (self.current_page) |*p| {
-        self.controller.setQueue(p.queue);
+        self.controller.setQueue(p.view_state.queue.items);
     }
 
     self.controller.play(ctx.idx);

@@ -17,25 +17,60 @@ pub const RowCtx = struct {
     suppressed: bool = false,
 };
 
-pub const PageBuilt = struct {
-    page: *adw.NavigationPage,
-    fav_buttons: std.StringHashMapUnmanaged(*gtk.Button) = .empty,
-    queue: []usize = &.{},
-
-    pub fn deinit(self: *PageBuilt) void {
-        self.fav_buttons.deinit(std.heap.page_allocator);
-        if (self.queue.len > 0) std.heap.page_allocator.free(self.queue);
-    }
+const FavCtx = struct {
+    fav: *favorites.Favorites,
+    track_path: []const u8,
 };
 
 const TrackEntry = struct {
     track: *const library.Track,
     index: usize,
+    row: ?*gtk.ListBoxRow = null,
 };
 
-const TrackListResult = struct {
-    scroll: *gtk.ScrolledWindow,
+const SortMode = enum { title, artist, album, duration };
+
+// Estado interno de la vista
+const ViewState = struct {
+    allocator: std.mem.Allocator,
+    all_entries: std.ArrayListUnmanaged(TrackEntry) = .empty,
+    visible_entries: std.ArrayListUnmanaged(TrackEntry) = .empty,
     list_box: *gtk.ListBox,
+    scroll: *gtk.ScrolledWindow,
+    fav_buttons: std.StringHashMapUnmanaged(*gtk.Button) = .empty,
+    row_ctxs: std.ArrayListUnmanaged(*RowCtx) = .empty,
+    fav_ctxs: std.ArrayListUnmanaged(*FavCtx) = .empty,
+    fav: *favorites.Favorites,
+    activation_ctx: ?*anyopaque,
+    on_pressed: ?RowPressedFn,
+    sort_mode: SortMode = .title,
+    query_buf: [256]u8 = undefined,
+    query_len: usize = 0,
+    queue: std.ArrayListUnmanaged(usize) = .empty,
+
+    pub fn deinit(self: *ViewState) void {
+        for (self.row_ctxs.items) |ptr| self.allocator.destroy(ptr);
+        self.row_ctxs.deinit(self.allocator);
+        
+        for (self.fav_ctxs.items) |ptr| self.allocator.destroy(ptr);
+        self.fav_ctxs.deinit(self.allocator);
+
+        self.fav_buttons.deinit(self.allocator);
+        self.all_entries.deinit(self.allocator);
+        self.visible_entries.deinit(self.allocator);
+        self.queue.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+};
+
+pub const PageBuilt = struct {
+    page: *adw.NavigationPage,
+    view_state: *ViewState,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PageBuilt) void {
+        self.view_state.deinit();
+    }
 };
 
 pub fn buildPage(
@@ -45,89 +80,315 @@ pub fn buildPage(
     activation_ctx: ?*anyopaque,
     on_pressed: ?RowPressedFn,
 ) PageBuilt {
-    var fav_buttons: std.StringHashMapUnmanaged(*gtk.Button) = .empty;
-    const tb = buildToolbar(item, lib, fav, activation_ctx, on_pressed, &fav_buttons);
-    const page = adw.NavigationPage.new(@ptrCast(@alignCast(tb)), item.title());
+    const allocator = std.heap.page_allocator;
+    
+    const scroll = gtk.ScrolledWindow.new();
+    gtk.ScrolledWindow.setPolicy(scroll, .automatic, .automatic);
+    const list = gtk.ListBox.new();
+    gtk.Widget.addCssClass(@ptrCast(@alignCast(list)), "boxed-list");
+    gtk.Widget.setMarginTop(@ptrCast(@alignCast(list)), 12);
+    gtk.Widget.setMarginBottom(@ptrCast(@alignCast(list)), 12);
+    gtk.Widget.setMarginStart(@ptrCast(@alignCast(list)), 12);
+    gtk.Widget.setMarginEnd(@ptrCast(@alignCast(list)), 12);
+    gtk.ScrolledWindow.setChild(scroll, @ptrCast(@alignCast(list)));
 
-    const alloc = std.heap.page_allocator;
-    var queue: []usize = &.{};
+    const vs = allocator.create(ViewState) catch unreachable;
+    vs.* = .{
+        .allocator = allocator,
+        .list_box = list,
+        .scroll = scroll,
+        .fav = fav,
+        .activation_ctx = activation_ctx,
+        .on_pressed = on_pressed,
+    };
+
+    var has_tracks = false;
     if (lib) |l| {
-        var q: std.ArrayListUnmanaged(usize) = .empty;
         switch (item) {
             .todas, .anadidos_recientemente => {
-                for (0..l.tracks.len) |i| {
-                    q.append(alloc, i) catch {};
+                for (l.tracks, 0..) |*t, i| {
+                    vs.all_entries.append(allocator, .{ .track = t, .index = i }) catch {};
                 }
+                has_tracks = l.tracks.len > 0;
             },
             .favoritos => {
-                for (l.tracks, 0..) |t, i| {
+                for (l.tracks, 0..) |*t, i| {
                     if (fav.isFavorite(t.path)) {
-                        q.append(alloc, i) catch {};
+                        vs.all_entries.append(allocator, .{ .track = t, .index = i }) catch {};
                     }
                 }
+                has_tracks = vs.all_entries.items.len > 0;
             },
             else => {},
         }
-        if (q.items.len > 0) {
-            queue = q.toOwnedSlice(alloc) catch &.{};
-        } else {
-            q.deinit(alloc);
-        }
     }
 
-    return .{ .page = page, .fav_buttons = fav_buttons, .queue = queue };
-}
-
-fn buildToolbar(
-    item: sidebar.NavItem,
-    lib: ?*library.Library,
-    fav: *favorites.Favorites,
-    activation_ctx: ?*anyopaque,
-    on_pressed: ?RowPressedFn,
-    fav_buttons: *std.StringHashMapUnmanaged(*gtk.Button),
-) *adw.ToolbarView {
     const toolbar = adw.ToolbarView.new();
     const header = adw.HeaderBar.new();
     adw.ToolbarView.addTopBar(toolbar, @ptrCast(@alignCast(header)));
 
-    switch (item) {
-        .todas, .anadidos_recientemente => {
-            if (lib) |l| {
-                if (l.tracks.len > 0) {
-                    const alloc = std.heap.page_allocator;
-                    var entries: std.ArrayListUnmanaged(TrackEntry) = .empty;
-                    defer entries.deinit(alloc);
-                    for (l.tracks, 0..) |*t, i| {
-                        entries.append(alloc, .{ .track = t, .index = i }) catch {};
-                    }
-                    const tl = buildTrackList(entries.items, fav, activation_ctx, on_pressed, fav_buttons);
-                    adw.ToolbarView.setContent(toolbar, @ptrCast(@alignCast(tl.scroll)));
-                    return toolbar;
-                }
-            }
-            showEmptyState(toolbar, item);
-        },
-        .favoritos => {
-            if (lib) |l| {
-                const alloc = std.heap.page_allocator;
-                var entries: std.ArrayListUnmanaged(TrackEntry) = .empty;
-                defer entries.deinit(alloc);
-                for (l.tracks, 0..) |*t, i| {
-                    if (fav.isFavorite(t.path)) {
-                        entries.append(alloc, .{ .track = t, .index = i }) catch {};
-                    }
-                }
-                if (entries.items.len > 0) {
-                    const tl = buildTrackList(entries.items, fav, activation_ctx, on_pressed, fav_buttons);
-                    adw.ToolbarView.setContent(toolbar, @ptrCast(@alignCast(tl.scroll)));
-                    return toolbar;
-                }
-            }
-            showEmptyState(toolbar, item);
-        },
-        else => showEmptyState(toolbar, item),
+    if (has_tracks) {
+        // 1. Ordenar inicialmente y construir la lista
+        sortEntries(vs);
+        buildTrackList(vs);
+        applyFilter(vs, "");
+
+        // 2. Añadir Buscador
+        const search = gtk.SearchEntry.new();
+        gtk.SearchEntry.setPlaceholderText(search, "Buscar...");
+        gtk.Widget.setSizeRequest(@ptrCast(@alignCast(search)), 240, -1);
+        adw.HeaderBar.packStart(header, @ptrCast(@alignCast(search)));
+        gtk.SearchEntry.setSearchDelay(search, 100);
+        _ = gtk.SearchEntry.signals.search_changed.connect(search, *ViewState, onSearchChanged, vs, .{});
+
+        // 3. Añadir Botón de Ordenar (Popover)
+        const menu_btn = gtk.MenuButton.new();
+        gtk.MenuButton.setIconName(menu_btn, "view-sort-descending-symbolic");
+        gtk.Widget.setTooltipText(@ptrCast(@alignCast(menu_btn)), "Ordenar por...");
+        gtk.Widget.addCssClass(@ptrCast(@alignCast(menu_btn)), "flat");
+
+        const popover = gtk.Popover.new();
+        const box = gtk.Box.new(gtk.Orientation.vertical, 4);
+        gtk.Widget.setMarginTop(@ptrCast(@alignCast(box)), 8);
+        gtk.Widget.setMarginBottom(@ptrCast(@alignCast(box)), 8);
+        gtk.Widget.setMarginStart(@ptrCast(@alignCast(box)), 8);
+        gtk.Widget.setMarginEnd(@ptrCast(@alignCast(box)), 8);
+
+        const btn_title = gtk.Button.newWithLabel("Título");
+        gtk.Widget.addCssClass(@ptrCast(@alignCast(btn_title)), "flat");
+        _ = gtk.Button.signals.clicked.connect(btn_title, *ViewState, onSortTitleClicked, vs, .{});
+        gtk.Box.append(box, @ptrCast(@alignCast(btn_title)));
+
+        const btn_artist = gtk.Button.newWithLabel("Artista");
+        gtk.Widget.addCssClass(@ptrCast(@alignCast(btn_artist)), "flat");
+        _ = gtk.Button.signals.clicked.connect(btn_artist, *ViewState, onSortArtistClicked, vs, .{});
+        gtk.Box.append(box, @ptrCast(@alignCast(btn_artist)));
+
+        const btn_album = gtk.Button.newWithLabel("Álbum");
+        gtk.Widget.addCssClass(@ptrCast(@alignCast(btn_album)), "flat");
+        _ = gtk.Button.signals.clicked.connect(btn_album, *ViewState, onSortAlbumClicked, vs, .{});
+        gtk.Box.append(box, @ptrCast(@alignCast(btn_album)));
+
+        const btn_duration = gtk.Button.newWithLabel("Duración");
+        gtk.Widget.addCssClass(@ptrCast(@alignCast(btn_duration)), "flat");
+        _ = gtk.Button.signals.clicked.connect(btn_duration, *ViewState, onSortDurationClicked, vs, .{});
+        gtk.Box.append(box, @ptrCast(@alignCast(btn_duration)));
+
+        gtk.Popover.setChild(popover, @ptrCast(@alignCast(box)));
+        gtk.MenuButton.setPopover(menu_btn, popover);
+        adw.HeaderBar.packEnd(header, @ptrCast(@alignCast(menu_btn)));
+
+        adw.ToolbarView.setContent(toolbar, @ptrCast(@alignCast(scroll)));
+    } else {
+        showEmptyState(toolbar, item);
     }
-    return toolbar;
+
+    const page = adw.NavigationPage.new(@ptrCast(@alignCast(toolbar)), item.title());
+    return .{ .page = page, .view_state = vs, .allocator = allocator };
+}
+
+fn sortEntries(vs: *ViewState) void {
+    const sortFn = struct {
+        fn lessThan(mode: SortMode, a: TrackEntry, b: TrackEntry) bool {
+            switch (mode) {
+                .title => {
+                    const at = a.track.info.title orelse "";
+                    const bt = b.track.info.title orelse "";
+                    return std.mem.lessThan(u8, at, bt);
+                },
+                .artist => {
+                    const aa = a.track.info.artist orelse "";
+                    const ba = b.track.info.artist orelse "";
+                    return std.mem.lessThan(u8, aa, ba);
+                },
+                .album => {
+                    const aa = a.track.info.album orelse "";
+                    const ba = b.track.info.album orelse "";
+                    return std.mem.lessThan(u8, aa, ba);
+                },
+                .duration => {
+                    return getDuration(a.track) < getDuration(b.track);
+                },
+            }
+        }
+    }.lessThan;
+    std.mem.sort(TrackEntry, vs.all_entries.items, vs.sort_mode, sortFn);
+}
+
+fn getDuration(track: *const library.Track) f64 {
+    if (track.info.sample_rate == 0) return 0;
+    return @as(f64, @floatFromInt(track.info.duration_frames)) / @as(f64, @floatFromInt(track.info.sample_rate));
+}
+
+fn rebuildList(vs: *ViewState) void {
+    // Destruir contextos viejos
+    for (vs.row_ctxs.items) |ptr| vs.allocator.destroy(ptr);
+    vs.row_ctxs.clearRetainingCapacity();
+    for (vs.fav_ctxs.items) |ptr| vs.allocator.destroy(ptr);
+    vs.fav_ctxs.clearRetainingCapacity();
+    vs.fav_buttons.clearRetainingCapacity();
+
+    // Eliminar widgets visuales
+    var child = gtk.Widget.getFirstChild(@ptrCast(@alignCast(vs.list_box)));
+    while (child != null) {
+        gtk.ListBox.remove(vs.list_box, @ptrCast(@alignCast(child)));
+        child = gtk.Widget.getFirstChild(@ptrCast(@alignCast(vs.list_box)));
+    }
+    
+    // Volver a construir
+    buildTrackList(vs);
+}
+
+fn buildTrackList(vs: *ViewState) void {
+    for (vs.all_entries.items) |*entry| {
+        const track = entry.track.*;
+        const row = adw.ActionRow.new();
+
+        const title_str: []const u8 = track.info.title orelse std.fs.path.basename(track.path);
+        const title_z = vs.allocator.dupeZ(u8, title_str) catch continue;
+        defer vs.allocator.free(title_z);
+        adw.PreferencesRow.setTitle(@ptrCast(@alignCast(row)), title_z.ptr);
+
+        var buf: [512]u8 = undefined;
+        const subtitle: []const u8 = blk: {
+            const artist = track.info.artist;
+            const album = track.info.album;
+            if (artist != null and album != null) {
+                break :blk std.fmt.bufPrint(&buf, "{s} — {s}", .{ artist.?, album.? }) catch track.path;
+            }
+            if (artist) |a| break :blk a;
+            if (album) |al| break :blk al;
+            break :blk track.path;
+        };
+        const subtitle_z = vs.allocator.dupeZ(u8, subtitle) catch continue;
+        defer vs.allocator.free(subtitle_z);
+        adw.ActionRow.setSubtitle(row, subtitle_z.ptr);
+
+        const img = gtk.Image.new();
+        gtk.Image.setPixelSize(img, 40);
+        var cover_loaded = false;
+        if (track.info.cover_data) |data| {
+            const bytes_obj = glib.Bytes.new(@ptrCast(data.ptr), data.len);
+            defer glib.Bytes.unref(bytes_obj);
+            const texture_opt = gdk.Texture.newFromBytes(bytes_obj, null);
+            if (texture_opt) |texture| {
+                gtk.Image.setFromPaintable(img, @ptrCast(@alignCast(texture)));
+                cover_loaded = true;
+            }
+        }
+        if (!cover_loaded) {
+            gtk.Image.setFromIconName(img, "media-optical-symbolic");
+            gtk.Widget.addCssClass(@ptrCast(@alignCast(img)), "dim-label");
+        }
+        adw.ActionRow.addPrefix(row, @ptrCast(@alignCast(img)));
+
+        const ctx = vs.allocator.create(RowCtx) catch continue;
+        ctx.* = .{ .app = vs.activation_ctx orelse continue, .idx = entry.index, .fav = vs.fav, .track_path = track.path };
+        vs.row_ctxs.append(vs.allocator, ctx) catch {};
+
+        const is_fav = vs.fav.isFavorite(track.path);
+        const star_icon: [:0]const u8 = if (is_fav) "starred-symbolic" else "non-starred-symbolic";
+        const fav_btn = gtk.Button.newFromIconName(star_icon);
+        gtk.Widget.addCssClass(@ptrCast(@alignCast(fav_btn)), "flat");
+        gtk.Widget.addCssClass(@ptrCast(@alignCast(fav_btn)), "circular");
+        adw.ActionRow.addSuffix(row, @ptrCast(@alignCast(fav_btn)));
+
+        vs.fav_buttons.put(vs.allocator, track.path, fav_btn) catch {};
+
+        const fctx = vs.allocator.create(FavCtx) catch continue;
+        fctx.* = .{ .fav = vs.fav, .track_path = track.path };
+        vs.fav_ctxs.append(vs.allocator, fctx) catch {};
+
+        _ = gtk.Button.signals.clicked.connect(fav_btn, *FavCtx, onFavoriteClicked, fctx, .{});
+
+        if (vs.activation_ctx != null and vs.on_pressed != null) {
+            const gesture = gtk.GestureClick.new();
+            gtk.GestureSingle.setButton(@ptrCast(@alignCast(gesture)), 1);
+            _ = gtk.GestureClick.signals.released.connect(gesture, *RowCtx, vs.on_pressed.?, ctx, .{});
+            gtk.Widget.addController(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(gesture)));
+        }
+
+        gtk.ListBox.append(vs.list_box, @ptrCast(@alignCast(row)));
+        entry.row = @ptrCast(@alignCast(row));
+    }
+}
+
+fn updateQueue(vs: *ViewState) void {
+    vs.queue.clearRetainingCapacity();
+    for (vs.visible_entries.items) |entry| {
+        vs.queue.append(vs.allocator, entry.index) catch {};
+    }
+}
+
+fn onSearchChanged(search: *gtk.SearchEntry, vs: *ViewState) callconv(.c) void {
+    const text_z = gtk.Editable.getText(@ptrCast(@alignCast(search)));
+    const query = std.mem.span(text_z);
+    const len = @min(query.len, vs.query_buf.len);
+    @memcpy(vs.query_buf[0..len], query[0..len]);
+    vs.query_len = len;
+    applyFilter(vs, vs.query_buf[0..vs.query_len]);
+}
+
+fn applyFilter(vs: *ViewState, query: []const u8) void {
+    vs.visible_entries.clearRetainingCapacity();
+
+    for (vs.all_entries.items) |entry| {
+        const t = entry.track;
+        var matches = true;
+        if (query.len > 0) {
+            const title = t.info.title orelse "";
+            const artist = t.info.artist orelse "";
+            const album = t.info.album orelse "";
+            matches = containsIgnoreCase(title, query) or
+                      containsIgnoreCase(artist, query) or
+                      containsIgnoreCase(album, query);
+        }
+        
+        if (entry.row) |row| {
+            gtk.Widget.setVisible(@ptrCast(@alignCast(row)), if (matches) 1 else 0);
+        }
+        
+        if (matches) {
+            vs.visible_entries.append(vs.allocator, entry) catch {};
+        }
+    }
+    updateQueue(vs);
+}
+
+fn refreshWithSort(vs: *ViewState) void {
+    sortEntries(vs);
+    rebuildList(vs);
+    applyFilter(vs, vs.query_buf[0..vs.query_len]);
+}
+
+fn onSortTitleClicked(btn: *gtk.Button, vs: *ViewState) callconv(.c) void {
+    _ = btn; vs.sort_mode = .title; refreshWithSort(vs);
+}
+fn onSortArtistClicked(btn: *gtk.Button, vs: *ViewState) callconv(.c) void {
+    _ = btn; vs.sort_mode = .artist; refreshWithSort(vs);
+}
+fn onSortAlbumClicked(btn: *gtk.Button, vs: *ViewState) callconv(.c) void {
+    _ = btn; vs.sort_mode = .album; refreshWithSort(vs);
+}
+fn onSortDurationClicked(btn: *gtk.Button, vs: *ViewState) callconv(.c) void {
+    _ = btn; vs.sort_mode = .duration; refreshWithSort(vs);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |c_needle, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c_needle)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 fn showEmptyState(toolbar: *adw.ToolbarView, item: sidebar.NavItem) void {
@@ -160,137 +421,7 @@ fn descriptionFor(item: sidebar.NavItem) [:0]const u8 {
     };
 }
 
-fn buildTrackList(
-    entries: []const TrackEntry,
-    fav: *favorites.Favorites,
-    activation_ctx: ?*anyopaque,
-    on_pressed: ?RowPressedFn,
-    fav_buttons: *std.StringHashMapUnmanaged(*gtk.Button),
-) TrackListResult {
-    const scroll = gtk.ScrolledWindow.new();
-    gtk.ScrolledWindow.setPolicy(scroll, .automatic, .automatic);
-
-    const list = gtk.ListBox.new();
-    gtk.Widget.addCssClass(@ptrCast(@alignCast(list)), "boxed-list");
-    gtk.Widget.setMarginTop(@ptrCast(@alignCast(list)), 12);
-    gtk.Widget.setMarginBottom(@ptrCast(@alignCast(list)), 12);
-    gtk.Widget.setMarginStart(@ptrCast(@alignCast(list)), 12);
-    gtk.Widget.setMarginEnd(@ptrCast(@alignCast(list)), 12);
-
-    for (entries) |entry| {
-        const track = entry.track.*;
-        const row = adw.ActionRow.new();
-
-        const title_str: []const u8 = track.info.title orelse std.fs.path.basename(track.path);
-        const title_z = std.heap.page_allocator.dupeZ(u8, title_str) catch continue;
-        defer std.heap.page_allocator.free(title_z);
-        adw.PreferencesRow.setTitle(@ptrCast(@alignCast(row)), title_z.ptr);
-
-        var buf: [512]u8 = undefined;
-        const subtitle: []const u8 = blk: {
-            const artist = track.info.artist;
-            const album = track.info.album;
-            if (artist != null and album != null) {
-                break :blk std.fmt.bufPrint(&buf, "{s} — {s}", .{ artist.?, album.? }) catch track.path;
-            }
-            if (artist) |a| break :blk a;
-            if (album) |al| break :blk al;
-            break :blk track.path;
-        };
-        const subtitle_z = std.heap.page_allocator.dupeZ(u8, subtitle) catch continue;
-        defer std.heap.page_allocator.free(subtitle_z);
-        adw.ActionRow.setSubtitle(row, subtitle_z.ptr);
-
-        const img = gtk.Image.new();
-        gtk.Image.setPixelSize(img, 40);
-        var cover_loaded = false;
-        if (track.info.cover_data) |data| {
-            const bytes_obj = glib.Bytes.new(@ptrCast(data.ptr), data.len);
-            defer glib.Bytes.unref(bytes_obj);
-            const texture_opt = gdk.Texture.newFromBytes(bytes_obj, null);
-            if (texture_opt) |texture| {
-                gtk.Image.setFromPaintable(img, @ptrCast(@alignCast(texture)));
-                cover_loaded = true;
-            }
-        }
-        if (!cover_loaded) {
-            gtk.Image.setFromIconName(img, "media-optical-symbolic");
-            gtk.Widget.addCssClass(@ptrCast(@alignCast(img)), "dim-label");
-        }
-        adw.ActionRow.addPrefix(row, @ptrCast(@alignCast(img)));
-
-        const ctx = std.heap.page_allocator.create(RowCtx) catch continue;
-        ctx.* = .{
-            .app = activation_ctx orelse continue,
-            .idx = entry.index,
-            .fav = fav,
-            .track_path = track.path,
-        };
-
-        const is_fav = fav.isFavorite(track.path);
-        const star_icon: [:0]const u8 = if (is_fav) "starred-symbolic" else "non-starred-symbolic";
-        const fav_btn = gtk.Button.newFromIconName(star_icon);
-        gtk.Widget.addCssClass(@ptrCast(@alignCast(fav_btn)), "flat");
-        gtk.Widget.addCssClass(@ptrCast(@alignCast(fav_btn)), "circular");
-        adw.ActionRow.addSuffix(row, @ptrCast(@alignCast(fav_btn)));
-
-        fav_buttons.put(std.heap.page_allocator, track.path, fav_btn) catch {};
-
-        const btn_gesture = gtk.GestureClick.new();
-        gtk.GestureSingle.setButton(@ptrCast(@alignCast(btn_gesture)), 1);
-        _ = gtk.GestureClick.signals.pressed.connect(
-            btn_gesture,
-            *RowCtx,
-            onFavoritePressed,
-            ctx,
-            .{},
-        );
-        gtk.Widget.addController(@ptrCast(@alignCast(fav_btn)), @ptrCast(@alignCast(btn_gesture)));
-
-        _ = gtk.Button.signals.clicked.connect(fav_btn, *RowCtx, onFavoriteClicked, ctx, .{});
-
-        if (activation_ctx != null and on_pressed != null) {
-            const gesture = gtk.GestureClick.new();
-            gtk.GestureSingle.setButton(@ptrCast(@alignCast(gesture)), 1);
-            _ = gtk.GestureClick.signals.released.connect(
-                gesture,
-                *RowCtx,
-                on_pressed.?,
-                ctx,
-                .{},
-            );
-            gtk.Widget.addController(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(gesture)));
-        }
-
-        gtk.ListBox.append(list, @ptrCast(@alignCast(row)));
-    }
-
-    gtk.ScrolledWindow.setChild(scroll, @ptrCast(@alignCast(list)));
-    return .{ .scroll = scroll, .list_box = list };
-}
-
-fn onFavoritePressed(
-    gesture: *gtk.GestureClick,
-    n: c_int,
-    x: f64,
-    y: f64,
-    ctx: *RowCtx,
-) callconv(.c) void {
-    _ = gesture;
-    _ = n;
-    _ = x;
-    _ = y;
-    ctx.suppressed = true;
-    _ = glib.timeoutAdd(500, resetSuppressed, ctx);
-}
-
-fn resetSuppressed(data: ?*anyopaque) callconv(.c) c_int {
-    const ctx: *RowCtx = @ptrCast(@alignCast(data.?));
-    ctx.suppressed = false;
-    return 0;
-}
-
-fn onFavoriteClicked(btn: *gtk.Button, ctx: *RowCtx) callconv(.c) void {
+fn onFavoriteClicked(btn: *gtk.Button, ctx: *FavCtx) callconv(.c) void {
     const now_fav = ctx.fav.toggle(ctx.track_path);
     const new_icon: [:0]const u8 = if (now_fav) "starred-symbolic" else "non-starred-symbolic";
     gtk.Button.setIconName(btn, new_icon);
